@@ -148,15 +148,17 @@ type TokenKind = enum
   TOKEN_KIND_DEFINE
   TOKEN_KIND_RAW
   
-  TOKEN_KIND_VAL
-  TOKEN_KIND_VAR
   TOKEN_KIND_PTR
   TOKEN_KIND_ADDR
 
+  TOKEN_KIND_VAL
+  TOKEN_KIND_VAR
+
   TOKEN_KIND_PROC
+  
   TOKEN_KIND_STRUCT
   TOKEN_KIND_UNION
-
+  
   TOKEN_KIND_IF
   TOKEN_KIND_ELIF
   TOKEN_KIND_ELSE
@@ -438,7 +440,9 @@ type NodeKind = enum
   NODE_KIND_RAW_STMT
   
   NODE_KIND_VARIABLE_DEF_STMT
+
   NODE_KIND_PROCEDURE_DEF_STMT
+
   NODE_KIND_STRUCTURE_DEF_STMT
   
   NODE_KIND_IF_STMT
@@ -465,6 +469,8 @@ type NodeKind = enum
 
 type Node = ref object
   location: TokenLocation
+
+  rslType: RslType
 
   case kind: NodeKind:
   of NODE_KIND_PROGRAM:
@@ -1117,9 +1123,16 @@ proc parse(this: Parser): void =
 #    Transpiler    #
 ####################
 
+const STAGE_NONE =              0x00
+const STAGE_PREPROCESSING =     0x02
+const STAGE_PROCESSING =        0x04
+const STAGE_POSTPROCESSING =    0x08
+const STAGE_ALL =               0xFF
+
 type Transpiler = ref object
   state: State
   
+  stage: int
   indentation: int
   
   input: Node
@@ -1130,6 +1143,7 @@ proc newTranspiler(state: State, input: Node): Transpiler =
 
   result.state = state
 
+  result.stage = STAGE_PREPROCESSING
   result.indentation = 0
 
   result.input = input
@@ -1175,153 +1189,114 @@ const C_OPERATOR_LEXEMES = toTable({
 template indent(this: Transpiler): void = this.indentation.inc()
 template dedent(this: Transpiler): void = this.indentation.dec()
 
-proc preprocess(this: Transpiler, node: Node): string =
-  result = ""
-
-  case node.kind:
-  of NODE_KIND_INCLUDE_STMT:
-    result &= "#include \"" & node.includeIdentifier & ".h\"\n"
-  of NODE_KIND_DEFINE_STMT:
-    result &= "#define " & node.defineIdentifier & " " & $node.defineKind & "\n"
-  of NODE_KIND_RAW_STMT:
-    result &= node.rawBody[1..node.rawBody.len()-2] & "\n"
-  of NODE_KIND_VARIABLE_DEF_STMT:
-    if node.variableIsConstant:
-      result &= "const "
-
-    result &= node.variableKind.toVariable(node.variableIdentifier)
-    
-    if node.variableValue != nil:
-      result &= " = " & this.preprocess(node.variableValue)
-    
-    result &= ";\n"
-  of NODE_KIND_PROCEDURE_DEF_STMT:
-    result &= $node.procedureReturnKind & " " & node.procedureIdentifier & "("
-    
-    for i, param in node.procedureParameters:
-      result &= $param.kind.toVariable(param.identifier)
-    
-      if i < high node.procedureParameters:
-        result &= ", "
-
-    result &= (");\n")
-  of NODE_KIND_STRUCTURE_DEF_STMT:
-    result &= "typedef " & node.structureKind & " " & node.structureIdentifier & " {\n"
-
-    this.indent()
-
-    for field in node.structureFields:
-      result &= ($field.kind.toVariable(field.identifier) & ";").indent(this.indentation, "\t") & "\n"
-    
-    this.dedent()
-
-    result &= "} " & node.structureIdentifier & ";\n"
-  of NODE_KIND_GROUPING_EXPR:
-    result = "(" & this.preprocess(node.groupingExpr) & ")"
-  of NODE_KIND_BINARY_EXPR:
-    if node.bopOperator == TOKEN_KIND_LOGICAL_XOR:
-      result &= "!" & this.preprocess(node.bopOperand1) & " != !" & this.preprocess(node.bopOperand2)
-    else:
-      result &= this.preprocess(node.bopOperand1) & " " & C_OPERATOR_LEXEMES[node.bopOperator] & " " & this.preprocess(node.bopOperand2)
-  of NODE_KIND_UNARY_EXPR:
-    result &= C_OPERATOR_LEXEMES[node.uopOperator] & this.preprocess(node.uopOperand1)
-  of NODE_KIND_LITERAL_EXPR:
-    if node.literalKind == TOKEN_KIND_BOOLEAN:
-      if node.literalValue == "false":
-        result &= "0"
-      else:
-        result &= "1"
-    else: 
-      result &= node.literalValue
-  of NODE_KIND_REFERENCE_EXPR:
-    result &= node.referenceIdentifier
-  of NODE_KIND_FIELD_ACCESS_EXPR:
-    result &= node.fieldParent & "." & node.fieldIdentifier
-  of NODE_KIND_PROC_CALL_EXPR:
-    result &= node.callIdentifier & "("
-    
-    for i, arg in node.callArguments:
-      result &= this.preprocess(arg)
-    
-      if i < high node.callArguments:
-        result &= ", "
-
-    result &= ")"
-  of NODE_KIND_STRUCTURE_INIT_EXPR:
-    result &= "{"
-
-    for i, arg in node.initArguments:
-      result &= this.preprocess(arg)
-
-      if i < high node.initArguments:
-        result &= ", "
-
-    result &= "}"
-  else: discard
+template during(this: Transpiler, stages: int, body: untyped): void =
+  if (stages and this.stage) > 1:
+    body
 
 proc process(this: Transpiler, node: Node): string =
   result = ""
 
   case node.kind:
   of NODE_KIND_BLOCK_STMT:
-    result &= "{\n"
+    this.during(STAGE_PREPROCESSING or STAGE_PROCESSING):
+      result &= "{\n"
 
-    this.indent()
+      this.indent()
 
-    for child in node.blockBody:
-      result &= this.process(child).indent(this.indentation, "\t") & "\n"
+      for child in node.blockBody:
+        result &= this.process(child).indent(this.indentation, "\t") & "\n"
 
-    this.dedent()
-    
-    result &= "}\n"
+      this.dedent()
+      
+      result &= "}\n"
+  of NODE_KIND_INCLUDE_STMT:
+    this.during(STAGE_PREPROCESSING):
+      result &= "#include \"" & node.includeIdentifier & ".h\"\n"
+  of NODE_KIND_DEFINE_STMT:
+    this.during(STAGE_PREPROCESSING):
+      result &= "#define " & node.defineIdentifier & " " & $node.defineKind & "\n"
   of NODE_KIND_RAW_STMT:
-    if not node.rawIsGlobal:
+    this.during(STAGE_PREPROCESSING):
       result &= node.rawBody[1..node.rawBody.len()-2] & "\n"
+    
+    this.during(STAGE_PROCESSING):
+      if not node.rawIsGlobal:
+        result &= node.rawBody[1..node.rawBody.len()-2] & "\n"
   of NODE_KIND_VARIABLE_DEF_STMT:
-    if not node.variableIsGlobal:
+    this.during(STAGE_PREPROCESSING):
       if node.variableIsConstant:
         result &= "const "
 
       result &= $node.variableKind.toVariable(node.variableIdentifier)
       
       if node.variableValue != nil:
-        result &= " = " & this.preprocess(node.variableValue)
+        result &= " = " & this.process(node.variableValue)
       
       result &= ";\n"
+
+    this.during(STAGE_PROCESSING):
+      if not node.variableIsGlobal:
+        if node.variableIsConstant:
+          result &= "const "
+
+        result &= $node.variableKind.toVariable(node.variableIdentifier)
+        
+        if node.variableValue != nil:
+          result &= " = " & this.process(node.variableValue)
+        
+        result &= ";\n"
   of NODE_KIND_PROCEDURE_DEF_STMT:
-    result &= $node.procedureReturnKind & " " & node.procedureIdentifier & "("
-    
-    for i, param in node.procedureParameters:
-      result &= param.kind.toVariable(param.identifier)
-    
-      if i < high node.procedureParameters:
-        result &= ", "
+    this.during(STAGE_PREPROCESSING or STAGE_PROCESSING):
+      result &= $node.procedureReturnKind & " " & node.procedureIdentifier & "("
+      
+      for i, param in node.procedureParameters:
+        result &= param.kind.toVariable(param.identifier)
+      
+        if i < high node.procedureParameters:
+          result &= ", "
 
-    result &= (") {\n")
+    this.during(STAGE_PREPROCESSING):
+      result &= ");\n"
     
-    this.indent()
-
-    if node.procedureBody.kind == NODE_KIND_BLOCK_STMT:
-      for child in node.procedureBody.blockBody:
-        result &= this.process(child).indent(this.indentation, "\t") & "\n"
-    else:
-      result &= this.process(node.procedureBody).indent(this.indentation, "\t") & "\n"
+    this.during(STAGE_PROCESSING):
+      result &= ") {\n"
+      
+      this.indent()
     
-    this.dedent()
-    
-    result &= ("}\n")
+      if node.procedureBody.kind == NODE_KIND_BLOCK_STMT:
+        for child in node.procedureBody.blockBody:
+          result &= this.process(child).indent(this.indentation, "\t") & "\n"
+      else:
+        result &= this.process(node.procedureBody).indent(this.indentation, "\t") & "\n"
+      
+      this.dedent()
+      
+      result &= ("}\n")
   of NODE_KIND_STRUCTURE_DEF_STMT:
-    if not node.structureIsGlobal:
+    this.during(STAGE_PREPROCESSING):
       result &= "typedef " & node.structureKind & " " & node.structureIdentifier & " {\n"
 
       this.indent()
 
       for field in node.structureFields:
         result &= (field.kind.toVariable(field.identifier) & ";").indent(this.indentation, "\t") & "\n"
-      
+        
       this.dedent()
 
       result &= "} " & node.structureIdentifier & ";\n"
+
+    this.during(STAGE_PROCESSING):
+      if not node.structureIsGlobal:
+        result &= "typedef " & node.structureKind & " " & node.structureIdentifier & " {\n"
+
+        this.indent()
+
+        for field in node.structureFields:
+          result &= (field.kind.toVariable(field.identifier) & ";").indent(this.indentation, "\t") & "\n"
+        
+        this.dedent()
+
+        result &= "} " & node.structureIdentifier & ";\n"
   of NODE_KIND_IF_STMT:
     result &= "if ("
       
@@ -1478,13 +1453,17 @@ proc transpile(this: Transpiler): void =
   this.output[1] &= "#ifndef " & (this.state.packageIdentifier & "_H").replace(".", "_").toUpper() & "\n"
   this.output[1] &= "#define " & (this.state.packageIdentifier & "_H").replace(".", "_").toUpper() & "\n"
   
+  this.stage = STAGE_PREPROCESSING
+
   for child in this.input.programBody:
-    this.output[1] &= this.preprocess(child)
+    this.output[1] &= this.process(child)
 
   this.output[1] &= "#endif\n"
 
   this.output[0] &= "#include \"" & this.state.sourceName.changeFileExt(".h") & "\"\n"
 
+  this.stage = STAGE_PROCESSING
+  
   for child in this.input.programBody:
     this.output[0] &= this.process(child)
 
